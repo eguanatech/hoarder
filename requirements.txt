@@ -1,0 +1,11 @@
+asgiref==3.12.1
+boto3==1.43.105
+botocore==1.43.105
+Django==5.2.17
+jmespath==1.1.0
+python-dateutil==2.9.0.post0
+s3transfer==0.19.2
+six==1.17.0
+sqlparse==0.6.0
+typing_extensions==4.16.0
+urllib3==2.8.0
