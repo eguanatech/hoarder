@@ -1,14 +1,24 @@
 from django.core.management.base import BaseCommand
 from s3_ingestion.models import RawS3
-from django.db import transaction
-# Add your S3 download logic here
 
 import boto3
 import json
 import zlib
-
+import threading
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from s3_ingestion import process_s3
+
+
+_thread_local = threading.local()
+
+
+def _s3_client():
+    """Return a per-thread boto3 S3 client (boto3 clients are not thread-safe)."""
+    if not hasattr(_thread_local, 's3'):
+        _thread_local.s3 = boto3.client('s3')
+    return _thread_local.s3
+
 
 
 class Command(BaseCommand):
@@ -18,18 +28,12 @@ class Command(BaseCommand):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.s3=boto3.client('s3')
-        self.paginator=self.s3.get_paginator('list_objects_v2')
+        self.paginator = boto3.client('s3').get_paginator('list_objects_v2')
 
-        self.limitfiles=1000
-        self.newfiles=list()
+        self.limitfiles = 1000
+        self.newfiles = list()
+        self.disable_processing = False
 
-        self.disable_processing=False
-
-        
-        
-
-        pass
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -80,52 +84,110 @@ class Command(BaseCommand):
             self.disable_processing=disablepros
 
         if bucket is not None and path is not None:
-            
+
             self.stdout.write(self.style.SUCCESS(f'Downloading from S3 bucket: {bucket}   path: {path}'))
 
-            filename=self.get_filename(bucket,path)
+            max_workers = 20
+            chunk_size = 2000
 
-            print('length of filenames: '+str(len(filename)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for chunk in self._iter_pending_chunks(bucket, path, chunk_size):
+                    self._process_chunk(executor, bucket, chunk)
 
-            for x in filename:
+        print(f'Done. {len(self.newfiles)} new files downloaded.')
 
-                
-                filename_nodir=x.split('/')[-1]
-                date=datetime.datetime.now(datetime.timezone.utc)
+    def _iter_pending_chunks(self, bucket, path, chunk_size):
+        """Stream S3 keys in pages, yielding chunks of keys not already in the DB.
 
-                if self.search_filename_in_raws3(filename_nodir) == False:   #prevent duplicat entries in database
-                    
-                    s3_dict=self.get_s3_object(bucket,x)      #ONLY DOWNLOAD IF NOT IN DATABASE
-                    #print("Downloaded S3 object for filename %r: "%(s3_object))
+        Never loads all keys into memory at once — each page is checked against
+        the DB and discarded before the next page is fetched.
+        """
+        total_seen = 0
+        pending_buffer = []
 
-                    #atomic operation, prevents  crash occurs on and only save in RawS3 table
-                    with transaction.atomic():
-                        raws3obj=self.put_dict_in_model(s3_dict,bucket,filename_nodir,x, date)
-                        self.newfiles.append(filename_nodir)
-                        #parse json and populat decoded database
-                        if self.disable_processing==False and raws3obj is not None:
-                            table = process_s3.parse_raw_json(s3_dict, x, raws3obj.id)
-                            created = process_s3.parsedtables_to_models(table)
-                            print(created)
+        for page in self.paginator.paginate(Bucket=bucket, Prefix=path):
+            for obj in page.get('Contents', []):
+                if self.limitfiles >= 0 and total_seen >= self.limitfiles:
+                    if pending_buffer:
+                        yield pending_buffer
+                    return
 
-                else:
-                    print ("file %r already exists in the database" % (filename_nodir))
-                    pass
+                key = obj['Key']
+                filename_nodir = key.split('/')[-1]
+                total_seen += 1
+                pending_buffer.append(key)
 
-        for n in self.newfiles:
-            print('newly downloaded file: %r' % (n))
-            
+            # Check this page's keys against the DB and drop already-stored ones.
+            if pending_buffer:
+                names = [k.split('/')[-1] for k in pending_buffer]
+                existing = set(
+                    RawS3.objects.filter(filename__in=names).values_list('filename', flat=True)
+                )
+                pending_buffer = [k for k in pending_buffer if k.split('/')[-1] not in existing]
+
+            while len(pending_buffer) >= chunk_size:
+                yield pending_buffer[:chunk_size]
+                pending_buffer = pending_buffer[chunk_size:]
+
+        if pending_buffer:
+            yield pending_buffer
+
+    def _process_chunk(self, executor, bucket, chunk):
+        """Fetch a chunk of S3 keys concurrently, bulk-insert into RawS3, then parse."""
+        futures = {
+            executor.submit(self.get_s3_object, bucket, key): key
+            for key in chunk
+        }
+
+        batch = []
+        for future in as_completed(futures):
+            key = futures[future]
+            filename_nodir = key.split('/')[-1]
+            try:
+                s3_dict = future.result()
+            except Exception as exc:
+                print(f'Error downloading {filename_nodir}: {exc}')
+                continue
+
+            date = datetime.datetime.now(datetime.timezone.utc)
+            batch.append((filename_nodir, key, s3_dict, date))
+
+        if not batch:
+            return
+
+        objects_to_create = [
+            RawS3(
+                filename=fn,
+                pathfilename=key,
+                s3_bucket=bucket,
+                rawjson=json.dumps(s3_dict),
+                date=date,
+            )
+            for fn, key, s3_dict, date in batch
+        ]
+
+        created_rows = RawS3.objects.bulk_create(objects_to_create, batch_size=len(batch))
+        self.newfiles.extend(row.filename for row in created_rows)
+        print(f'Inserted {len(created_rows)} rows (total so far: {len(self.newfiles)})')
+
+        if not self.disable_processing:
+            merged = process_s3.ParsedTables(*([] for _ in process_s3.ParsedTables._fields))
+            for row, (_, _, s3_dict, _) in zip(created_rows, batch):
+                if row is not None:
+                    table = process_s3.parse_raw_json(s3_dict, row.pathfilename, row.id)
+                    for field in process_s3.ParsedTables._fields:
+                        getattr(merged, field).extend(getattr(table, field))
+            process_s3.parsedtables_to_models(merged)
 
 
-    def search_filename_in_raws3(self,filename:str)->bool:
-        objectsfiles=RawS3.objects.filter(filename=filename)
+
+    def search_filename_in_raws3(self, filename: str) -> bool:
+        objectsfiles = RawS3.objects.filter(filename=filename)
 
         if len(objectsfiles) > 1:
             print('warning duplicate files?!?')
 
-        if objectsfiles.exists():
-            return True
-        return False
+        return objectsfiles.exists()
 
 
 
@@ -155,8 +217,8 @@ class Command(BaseCommand):
 
 
 
-    def get_s3_object(self, bucket, filename):  #return dict,list,from json, empty dict if otherwise
-        obj=self.s3.get_object(Bucket=bucket, Key=filename)
+    def get_s3_object(self, bucket, filename):
+        obj = _s3_client().get_object(Bucket=bucket, Key=filename)
 
         returndict={}
         try:
