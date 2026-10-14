@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EMS Trends</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f5f7fa; color: #222; }
+
+    header {
+      background: #1a2340;
+      color: #fff;
+      padding: 1rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    header h1 { margin: 0; font-size: 1.4rem; }
+
+    main { max-width: 1200px; margin: 2rem auto; padding: 0 1.5rem; }
+
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.08);
+      padding: 1.5rem 2rem;
+      margin-bottom: 2rem;
+    }
+    .card h2 { margin: 0 0 1.2rem; font-size: 1.1rem; color: #1a2340; }
+
+    /* UID autocomplete */
+    .uid-wrapper { position: relative; max-width: 480px; }
+    .uid-wrapper input[type=text] {
+      width: 100%;
+      padding: .55rem .75rem;
+      border: 1px solid #c8cdd6;
+      border-radius: 6px;
+      font-size: .95rem;
+    }
+    #uid-suggestions {
+      position: absolute;
+      top: 100%;
+      left: 0; right: 0;
+      background: #fff;
+      border: 1px solid #c8cdd6;
+      border-top: none;
+      border-radius: 0 0 6px 6px;
+      max-height: 220px;
+      overflow-y: auto;
+      z-index: 100;
+      display: none;
+    }
+    #uid-suggestions li {
+      padding: .45rem .75rem;
+      cursor: pointer;
+      list-style: none;
+    }
+    #uid-suggestions li:hover { background: #eef2ff; }
+
+    /* Date row */
+    .date-row { display: flex; gap: 1.5rem; flex-wrap: wrap; margin-top: 1rem; }
+    .date-row label { font-size: .85rem; color: #555; display: block; margin-bottom: .3rem; }
+    .date-row input[type=date] {
+      padding: .5rem .65rem;
+      border: 1px solid #c8cdd6;
+      border-radius: 6px;
+      font-size: .9rem;
+    }
+
+    /* Properties grid */
+    .prop-groups { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1.2rem; margin-top: 1rem; }
+    .prop-group h3 {
+      font-size: .82rem;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #1a2340;
+      margin: 0 0 .6rem;
+      border-bottom: 2px solid #e3e8f0;
+      padding-bottom: .3rem;
+    }
+    .prop-group label {
+      display: flex;
+      align-items: center;
+      gap: .45rem;
+      font-size: .88rem;
+      padding: .2rem 0;
+      cursor: pointer;
+    }
+    .prop-group label:hover { color: #3b5bdb; }
+
+    /* Select-all toggle */
+    .group-toggle {
+      font-size: .75rem;
+      color: #3b5bdb;
+      cursor: pointer;
+      margin-left: .5rem;
+      text-decoration: underline;
+      user-select: none;
+    }
+
+    /* Submit */
+    .actions { margin-top: 1.4rem; display: flex; align-items: center; gap: 1rem; }
+    button[type=submit] {
+      background: #1a2340;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: .65rem 1.8rem;
+      font-size: .95rem;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    button[type=submit]:hover { background: #2e3f6e; }
+
+    /* Error */
+    .error-msg {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 6px;
+      padding: .75rem 1rem;
+      color: #7a5000;
+      margin-bottom: 1.5rem;
+    }
+
+    /* Chart */
+    #chart-container .card { padding: 1rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📈 EMS Trends</h1>
+</header>
+
+<main>
+  {% if error %}
+    <div class="error-msg">⚠ {{ error }}</div>
+  {% endif %}
+
+  <div class="card">
+    <h2>Query Parameters</h2>
+    <form method="post" id="trends-form">
+      {% csrf_token %}
+
+      <!-- UID search -->
+      <label style="font-size:.85rem;color:#555;display:block;margin-bottom:.3rem;">EMS UID</label>
+      <div class="uid-wrapper">
+        <input
+          type="text"
+          id="uid-input"
+          name="uid"
+          value="{{ selected_uid }}"
+          placeholder="Type to search…"
+          autocomplete="off"
+          required
+        >
+        <ul id="uid-suggestions"></ul>
+      </div>
+
+      <!-- Date range -->
+      <div class="date-row">
+        <div>
+          <label for="start-date">Start Date</label>
+          <input type="date" id="start-date" name="start_date" value="{{ selected_start }}">
+        </div>
+        <div>
+          <label for="end-date">End Date</label>
+          <input type="date" id="end-date" name="end_date" value="{{ selected_end }}">
+        </div>
+      </div>
+
+      <!-- Properties -->
+      <div style="margin-top:1.4rem;">
+        <div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.5rem;">
+          <strong style="font-size:.9rem;">Properties to plot</strong>
+          <span class="group-toggle" id="select-all-btn">select all</span>
+          <span class="group-toggle" id="deselect-all-btn">deselect all</span>
+        </div>
+        <div class="prop-groups">
+          {% for group_name, props in property_groups.items %}
+          <div class="prop-group">
+            <h3>
+              {{ group_name }}
+              <span class="group-toggle" data-group="{{ group_name }}">all</span>
+            </h3>
+            {% for field, label in props %}
+            <label>
+              <input
+                type="checkbox"
+                name="properties"
+                value="{{ field }}"
+                {% if field in selected_props %}checked{% endif %}
+              >
+              {{ label }}
+            </label>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="actions">
+        <button type="submit">Generate Chart</button>
+      </div>
+    </form>
+  </div>
+
+  {% if chart_div %}
+  <div id="chart-container">
+    <div class="card">
+      {{ chart_div|safe }}
+    </div>
+  </div>
+  {% endif %}
+</main>
+
+<script>
+  // UID autocomplete
+  const uidInput   = document.getElementById('uid-input');
+  const suggestions = document.getElementById('uid-suggestions');
+  let debounceTimer;
+
+  uidInput.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    const q = uidInput.value.trim();
+    if (!q) { suggestions.style.display = 'none'; return; }
+    debounceTimer = setTimeout(() => {
+      fetch(`{% url 's3_ingestion:uid_autocomplete' %}?q=${encodeURIComponent(q)}`)
+        .then(r => r.json())
+        .then(uids => {
+          suggestions.innerHTML = '';
+          if (!uids.length) { suggestions.style.display = 'none'; return; }
+          uids.forEach(uid => {
+            const li = document.createElement('li');
+            li.textContent = uid;
+            li.addEventListener('click', () => {
+              uidInput.value = uid;
+              suggestions.style.display = 'none';
+            });
+            suggestions.appendChild(li);
+          });
+          suggestions.style.display = 'block';
+        });
+    }, 250);
+  });
+
+  document.addEventListener('click', e => {
+    if (!uidInput.contains(e.target)) suggestions.style.display = 'none';
+  });
+
+  // Per-group select-all toggles
+  document.querySelectorAll('.group-toggle[data-group]').forEach(btn => {
+    let allChecked = false;
+    btn.addEventListener('click', () => {
+      const boxes = btn.closest('.prop-group').querySelectorAll('input[type=checkbox]');
+      allChecked = !allChecked;
+      boxes.forEach(cb => cb.checked = allChecked);
+      btn.textContent = allChecked ? 'none' : 'all';
+    });
+  });
+
+  // Global select/deselect all
+  document.getElementById('select-all-btn').addEventListener('click', () => {
+    document.querySelectorAll('input[name=properties]').forEach(cb => cb.checked = true);
+  });
+  document.getElementById('deselect-all-btn').addEventListener('click', () => {
+    document.querySelectorAll('input[name=properties]').forEach(cb => cb.checked = false);
+  });
+</script>
+</body>
+</html>
